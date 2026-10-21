@@ -1,0 +1,19 @@
+# ESP-IDF generated output
+build/
+*/build/
+**/build/
+managed_components/
+
+# Generated/local configuration backups
+sdkconfig.old
+sdkconfig.backup
+
+# Editor and host-specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python/cache artifacts
+__pycache__/
+*.pyc
