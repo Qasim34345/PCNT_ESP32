@@ -3,6 +3,7 @@
 
 #include "WAZEH_Channel.h"
 #include "WAZEH_CycleTime_Config.h"
+#include <array>
 #include <memory>
 
 class WAZEH_CycleTime {
@@ -25,7 +26,8 @@ public:
     void setTypedEventCallback(WAZEH_CycleTime_TypedEventCallback callback);
     WAZEH_CycleTime_Event loop();
 
-    // Configuration
+    // Configuration. setDebounceDelay updates currently configured channels;
+    // typed channel configurations retain their own debounce_ms value.
     void setRepeatDelay(unsigned long value) { repeat = value; }
     void setDebounceDelay(unsigned long value);
 
@@ -56,9 +58,9 @@ public:
 
 private:
     // Safe defaults are required when the default constructor + addChannel() is used.
-    unsigned long                   delay = WAZEH_CYCLETIME_DEBOUNCE_DELAY;
     unsigned long                   repeat = WAZEH_CYCLETIME_REPEAT_DELAY;
-    std::vector<std::unique_ptr<WAZEH_Channel>> channels;
+    std::array<std::unique_ptr<WAZEH_Channel>, WAZEH_CYCLETIME_MAX_CHANNELS> channels{};
+    size_t channelCount = 0;
     WAZEH_CycleTime_Event_Callback  callback;
     WAZEH_CycleTime_TypedEventCallback typedCallback;
 

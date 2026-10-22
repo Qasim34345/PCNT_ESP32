@@ -102,6 +102,8 @@ private:
     WAZEH_CycleTime_Edge _edge;
     uint64_t _softwarePulseCount;
     uint64_t _pulseCountOffset;
+    uint64_t _lastKnownTotalCount;
+    bool _hasLastKnownTotalCount;
     uint64_t _lastPulseSampleCount;
     int64_t _lastPulseSampleUs;
     float _pulseRateHz;

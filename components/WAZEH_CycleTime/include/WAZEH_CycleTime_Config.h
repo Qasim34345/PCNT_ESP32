@@ -2,8 +2,8 @@
  =========================================================================================
  * File:        WAZEH_CycleTime_Config.h
  * Author:      AMS-IoT
- * Version:     Rev_1.0.0
- * Date:        Dec 22 2025
+ * Version:     Rev_1.1.0
+ * Date:        Oct 21 2026
  * Brief:       This file provides WAZEH CycleTime configuration options.
  =========================================================================================
  * License:
@@ -39,7 +39,6 @@
 #define WAZEH_CYCLETIME_CONFIG_H
 
 #include <math.h>
-#include <vector>
 #include <stdio.h>
 #include <stdint.h>
 #include <functional>
@@ -101,6 +100,13 @@
 */
 
 #define WAZEH_CYCLETIME_REPEAT_DELAY                500    // Repeat event delay in ms
+
+#ifndef WAZEH_CYCLETIME_MAX_CHANNELS
+#define WAZEH_CYCLETIME_MAX_CHANNELS                16     // Fixed-capacity channel table; avoids vector allocation in the component
+#endif
+#if WAZEH_CYCLETIME_MAX_CHANNELS < 1
+#error "WAZEH_CYCLETIME_MAX_CHANNELS must be at least 1"
+#endif
 #define WAZEH_CYCLETIME_DEBOUNCE_DELAY              50     // Debounce delay in ms
 
 #define WAZEH_CYCLETIME_CHANNEL_PULLUP              4      // Enable internal pull-up resistor

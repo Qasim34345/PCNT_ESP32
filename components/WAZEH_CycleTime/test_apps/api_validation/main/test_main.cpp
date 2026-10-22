@@ -10,6 +10,7 @@
 namespace {
 constexpr gpio_num_t TEST_OUTPUT_GPIO = GPIO_NUM_4;
 constexpr gpio_num_t TEST_INPUT_GPIO = GPIO_NUM_5;
+constexpr gpio_num_t TEST_SECOND_INPUT_GPIO = GPIO_NUM_6;
 
 void configureTestOutput()
 {
@@ -34,10 +35,10 @@ void emitRisingEdgePulses(unsigned count)
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
-WAZEH_CycleTime_ChannelConfig makeInputConfig()
+WAZEH_CycleTime_ChannelConfig makeInputConfig(gpio_num_t pin = TEST_INPUT_GPIO)
 {
     WAZEH_CycleTime_ChannelConfig config{};
-    config.pin = TEST_INPUT_GPIO;
+    config.pin = pin;
     config.input_mode = CYCLETIME_INPUT_MODE_SWITCH;
     config.active_level = WAZEH_CycleTime_ActiveLevel::High;
     config.pull = WAZEH_CycleTime_Pull::Down;
@@ -115,6 +116,35 @@ TEST_CASE("hardware PCNT counts rising edges on GPIO loopback", "[wazeh][pcnt][p
 #endif
 }
 
+TEST_CASE("hardware PCNT counts two independent loopback inputs", "[wazeh][pcnt][multi_input]")
+{
+#if SOC_PCNT_SUPPORTED
+    configureTestOutput();
+    WAZEH_CycleTime cycleTime;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.addChannel(makeInputConfig(TEST_INPUT_GPIO)));
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.addChannel(makeInputConfig(TEST_SECOND_INPUT_GPIO)));
+
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.initPulseCounterByPinChecked(
+        TEST_INPUT_GPIO, WAZEH_CycleTime_Edge::Rising, 0, false));
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.initPulseCounterByPinChecked(
+        TEST_SECOND_INPUT_GPIO, WAZEH_CycleTime_Edge::Rising, 0, false));
+    TEST_ASSERT_TRUE(cycleTime.getChannel(TEST_INPUT_GPIO)->isPcntInitialized());
+    TEST_ASSERT_TRUE(cycleTime.getChannel(TEST_SECOND_INPUT_GPIO)->isPcntInitialized());
+
+    constexpr uint64_t expected = 8;
+    emitRisingEdgePulses(static_cast<unsigned>(expected));
+    uint64_t firstCount = 0;
+    uint64_t secondCount = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &firstCount));
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_SECOND_INPUT_GPIO, &secondCount));
+    TEST_ASSERT_EQUAL_UINT64(expected, firstCount);
+    TEST_ASSERT_EQUAL_UINT64(expected, secondCount);
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.deinit());
+#else
+    TEST_IGNORE_MESSAGE("Target does not provide PCNT hardware");
+#endif
+}
+
 TEST_CASE("GPIO interrupt fallback counts rising edges on GPIO loopback", "[wazeh][interrupt][pulse]")
 {
     configureTestOutput();
@@ -153,6 +183,83 @@ TEST_CASE("pulse reset preserves cumulative total", "[wazeh][pulse]")
     TEST_ASSERT_EQUAL_UINT64(5, after);
     TEST_ASSERT_EQUAL(ESP_OK, cycleTime.deinit());
 }
+
+TEST_CASE("reconfiguring the counter preserves cumulative software counts", "[wazeh][pulse][reconfigure]")
+{
+    configureTestOutput();
+    WAZEH_CycleTime cycleTime;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.addChannel(makeInputConfig()));
+    WAZEH_Channel *channel = cycleTime.getChannel(TEST_INPUT_GPIO);
+    TEST_ASSERT_NOT_NULL(channel);
+    TEST_ASSERT_EQUAL(ESP_OK, channel->useSoftwareCounterChecked());
+
+    emitRisingEdgePulses(3);
+    uint64_t before = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &before));
+    TEST_ASSERT_EQUAL_UINT64(3, before);
+
+    const esp_err_t initErr = cycleTime.initPulseCounterByPinChecked(
+        TEST_INPUT_GPIO, WAZEH_CycleTime_Edge::Rising, 0, true);
+    TEST_ASSERT_TRUE(initErr == ESP_OK || channel->isCounterAvailable());
+    TEST_ASSERT_TRUE(channel->isCounterAvailable());
+
+    emitRisingEdgePulses(2);
+    uint64_t after = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &after));
+    TEST_ASSERT_EQUAL_UINT64(5, after);
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.deinit());
+}
+
+TEST_CASE("software counter supports falling and both-edge selection", "[wazeh][interrupt][edges]")
+{
+    configureTestOutput();
+    WAZEH_CycleTime cycleTime;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.addChannel(makeInputConfig()));
+    WAZEH_Channel *channel = cycleTime.getChannel(TEST_INPUT_GPIO);
+    TEST_ASSERT_NOT_NULL(channel);
+
+    // Reconfigure to falling edges; each emitted pulse contributes one falling edge.
+    const esp_err_t fallingInit = cycleTime.initPulseCounterByPinChecked(
+        TEST_INPUT_GPIO, WAZEH_CycleTime_Edge::Falling, 0, true);
+    TEST_ASSERT_TRUE(fallingInit == ESP_OK || channel->isCounterAvailable());
+    TEST_ASSERT_EQUAL(ESP_OK, channel->useSoftwareCounterChecked());
+    emitRisingEdgePulses(4);
+    uint64_t falling = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &falling));
+    TEST_ASSERT_EQUAL_UINT64(4, falling);
+
+    const esp_err_t bothInit = cycleTime.initPulseCounterByPinChecked(
+        TEST_INPUT_GPIO, WAZEH_CycleTime_Edge::Both, 0, true);
+    TEST_ASSERT_TRUE(bothInit == ESP_OK || channel->isCounterAvailable());
+    TEST_ASSERT_EQUAL(ESP_OK, channel->useSoftwareCounterChecked());
+    emitRisingEdgePulses(3);
+    uint64_t both = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &both));
+    TEST_ASSERT_EQUAL_UINT64(10, both);
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.deinit());
+}
+
+#if SOC_PCNT_SUPPORTED
+TEST_CASE("hardware PCNT reset preserves cumulative total", "[wazeh][pcnt][reset]")
+{
+    configureTestOutput();
+    WAZEH_CycleTime cycleTime;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.addChannel(makeInputConfig()));
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.initPulseCounterByPinChecked(
+        TEST_INPUT_GPIO, WAZEH_CycleTime_Edge::Rising, 0, false));
+
+    emitRisingEdgePulses(4);
+    uint64_t before = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &before));
+    TEST_ASSERT_EQUAL_UINT64(4, before);
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.resetPulseCountChecked(TEST_INPUT_GPIO));
+    emitRisingEdgePulses(3);
+    uint64_t after = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.getPulseCount(TEST_INPUT_GPIO, &after));
+    TEST_ASSERT_EQUAL_UINT64(7, after);
+    TEST_ASSERT_EQUAL(ESP_OK, cycleTime.deinit());
+}
+#endif
 
 extern "C" void app_main(void)
 {

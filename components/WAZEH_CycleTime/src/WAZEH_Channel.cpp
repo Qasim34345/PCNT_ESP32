@@ -1,5 +1,6 @@
 #include "WAZEH_Channel.h"
 
+#include <inttypes.h>
 #include <limits.h>
 #include <soc/soc_caps.h>
 
@@ -19,6 +20,21 @@ gpio_pullup_t pullUpFor(WAZEH_CycleTime_Pull pull)
 gpio_pulldown_t pullDownFor(WAZEH_CycleTime_Pull pull)
 {
     return pull == WAZEH_CycleTime_Pull::Down ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE;
+}
+
+esp_err_t ensureGpioIsrService()
+{
+    static bool serviceReady = false;
+    if (serviceReady) {
+        return ESP_OK;
+    }
+
+    const esp_err_t err = gpio_install_isr_service(0);
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        serviceReady = true;
+        return ESP_OK;
+    }
+    return err;
 }
 
 WAZEH_CycleTime_ChannelConfig legacyConfig(uint8_t pin, uint8_t mode)
@@ -106,6 +122,8 @@ WAZEH_Channel::WAZEH_Channel(const WAZEH_CycleTime_ChannelConfig &config)
       _edge(WAZEH_CycleTime_Edge::Rising),
       _softwarePulseCount(0),
       _pulseCountOffset(0),
+      _lastKnownTotalCount(0),
+      _hasLastKnownTotalCount(false),
       _lastPulseSampleCount(0),
       _lastPulseSampleUs(0),
       _pulseRateHz(0.0f),
@@ -160,10 +178,24 @@ esp_err_t WAZEH_Channel::configureChecked()
     }
 
     const gpio_num_t pin = static_cast<gpio_num_t>(_pin);
+    const auto rollbackPinConfiguration = [this, pin]() -> esp_err_t {
+        esp_err_t cleanupErr = ESP_OK;
+        if (_gpioIsrRegistered) {
+            cleanupErr = releaseInputInterrupt();
+        } else {
+            cleanupErr = gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
+        }
+        if (cleanupErr == ESP_OK) {
+            const esp_err_t resetErr = gpio_reset_pin(pin);
+            if (resetErr != ESP_OK) cleanupErr = resetErr;
+        }
+        _configured = false;
+        return cleanupErr;
+    };
     const int level = gpio_get_level(pin);
     if (level < 0) {
-        (void)gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
-        return ESP_FAIL;
+        const esp_err_t cleanupErr = rollbackPinConfiguration();
+        return cleanupErr == ESP_OK ? ESP_FAIL : cleanupErr;
     }
 
     const int64_t nowUs = esp_timer_get_time();
@@ -175,25 +207,25 @@ esp_err_t WAZEH_Channel::configureChecked()
     _cycleStartUs = _cycleStarted ? static_cast<uint64_t>(nowUs) : 0;
     _cycleSawInactive = false;
 
-    esp_err_t isrErr = gpio_install_isr_service(0);
-    if (isrErr != ESP_OK && isrErr != ESP_ERR_INVALID_STATE) {
-        (void)gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
-        return isrErr;
+    esp_err_t isrErr = ensureGpioIsrService();
+    if (isrErr != ESP_OK) {
+        const esp_err_t cleanupErr = rollbackPinConfiguration();
+        return cleanupErr == ESP_OK ? isrErr : cleanupErr;
     }
     isrErr = gpio_set_intr_type(pin, GPIO_INTR_ANYEDGE);
     if (isrErr != ESP_OK) {
-        (void)gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
-        return isrErr;
+        const esp_err_t cleanupErr = rollbackPinConfiguration();
+        return cleanupErr == ESP_OK ? isrErr : cleanupErr;
     }
     isrErr = gpio_isr_handler_add(pin, gpioIsrHandler, this);
     if (isrErr != ESP_OK) {
-        (void)gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
-        return isrErr;
+        const esp_err_t cleanupErr = rollbackPinConfiguration();
+        return cleanupErr == ESP_OK ? isrErr : cleanupErr;
     }
     _gpioIsrRegistered = true;
     const int initialLevel = gpio_get_level(pin);
     if (initialLevel < 0) {
-        const esp_err_t cleanupErr = releaseInputInterrupt();
+        const esp_err_t cleanupErr = rollbackPinConfiguration();
         return cleanupErr == ESP_OK ? ESP_FAIL : cleanupErr;
     }
     const int64_t interruptStartUs = esp_timer_get_time();
@@ -210,8 +242,7 @@ esp_err_t WAZEH_Channel::configureChecked()
     portEXIT_CRITICAL(&_inputMux);
     isrErr = gpio_intr_enable(pin);
     if (isrErr != ESP_OK) {
-        const esp_err_t cleanupErr = releaseInputInterrupt();
-        _configured = false;
+        const esp_err_t cleanupErr = rollbackPinConfiguration();
         return cleanupErr == ESP_OK ? isrErr : cleanupErr;
     }
     _configured = true;
@@ -462,11 +493,16 @@ unsigned long WAZEH_Channel::calculateCycleTime()
 
 esp_err_t WAZEH_Channel::releasePulseCounter()
 {
+    // Once teardown begins, do not advertise the unit as a healthy backend until
+    // a subsequent initialization succeeds. Handles remain tracked for retry.
+    _pcntInitialized = false;
     esp_err_t firstError = ESP_OK;
 #if SOC_PCNT_SUPPORTED
     if (_pcntUnitStarted && _pcntUnit != nullptr && _ownsPcntUnit) {
         const esp_err_t err = pcnt_unit_stop(_pcntUnit);
-        if (err == ESP_OK) {
+        if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+            // INVALID_STATE can mean the driver is already stopped (for example,
+            // after an earlier partial failure). Continue cleanup idempotently.
             _pcntUnitStarted = false;
         } else if (firstError == ESP_OK) {
             firstError = err;
@@ -474,7 +510,7 @@ esp_err_t WAZEH_Channel::releasePulseCounter()
     }
     if (_pcntUnitEnabled && !_pcntUnitStarted && _pcntUnit != nullptr && _ownsPcntUnit) {
         const esp_err_t err = pcnt_unit_disable(_pcntUnit);
-        if (err == ESP_OK) {
+        if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
             _pcntUnitEnabled = false;
         } else if (firstError == ESP_OK) {
             firstError = err;
@@ -597,6 +633,8 @@ esp_err_t WAZEH_Channel::getPulseCount(uint64_t *count)
     } else {
         *count = _pulseCountOffset + backendCount;
     }
+    _lastKnownTotalCount = *count;
+    _hasLastKnownTotalCount = true;
     updatePulseStatistics(*count, esp_timer_get_time());
     _lastCounterError = ESP_OK;
     return ESP_OK;
@@ -672,41 +710,85 @@ long WAZEH_Channel::getPulseCountLastMinute()
 
 esp_err_t WAZEH_Channel::resetPulseCountChecked()
 {
-    uint64_t currentCount = 0;
+    if (!_configured || !isCounterAvailable()) {
+        _lastCounterError = ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint64_t currentTotal = 0;
     if (_usingSoftwareCounter) {
+        // Snapshot and clear under the same critical section used by the ISR so
+        // an edge cannot fall between the count snapshot and software reset.
         portENTER_CRITICAL(&_inputMux);
-        currentCount = _softwarePulseCount;
-        if (UINT64_MAX - _pulseCountOffset < currentCount) {
-            _pulseCountOffset = UINT64_MAX;
-        } else {
-            _pulseCountOffset += currentCount;
-        }
+        currentTotal = saturatingAdd(_pulseCountOffset, _softwarePulseCount);
+        _pulseCountOffset = currentTotal;
         _softwarePulseCount = 0;
         portEXIT_CRITICAL(&_inputMux);
     } else {
-        const esp_err_t readErr = readBackendCount(&currentCount);
-        if (readErr != ESP_OK) {
-            _lastCounterError = readErr;
-            return readErr;
-        }
 #if SOC_PCNT_SUPPORTED
-        const esp_err_t err = pcnt_unit_clear_count(_pcntUnit);
+        // Do not clear a borrowed PCNT unit: it may be shared with other channels.
+        // This component owns only the channel attached to that unit.
+        if (!_ownsPcntUnit || _pcntUnit == nullptr) {
+            _lastCounterError = ESP_ERR_NOT_SUPPORTED;
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        const bool restart = _pcntUnitStarted;
+        if (restart) {
+            const esp_err_t stopErr = pcnt_unit_stop(_pcntUnit);
+            if (stopErr != ESP_OK && stopErr != ESP_ERR_INVALID_STATE) {
+                _lastCounterError = stopErr;
+                return stopErr;
+            }
+            // INVALID_STATE is tolerated as an already-stopped unit; the following
+            // count read will still surface an unusable/disabled unit if applicable.
+            _pcntUnitStarted = false;
+        }
+        int raw = 0;
+        esp_err_t err = pcnt_unit_get_count(_pcntUnit, &raw);
+        bool cleared = false;
+        if (err == ESP_OK && raw >= 0) {
+            currentTotal = saturatingAdd(_pulseCountOffset, static_cast<uint64_t>(raw));
+            err = pcnt_unit_clear_count(_pcntUnit);
+            cleared = err == ESP_OK;
+            if (cleared) {
+                // Publish the cumulative offset only after clear succeeds. If start
+                // later fails, already-counted pulses remain represented in the total.
+                _pulseCountOffset = currentTotal;
+                _lastKnownTotalCount = currentTotal;
+                _hasLastKnownTotalCount = true;
+            }
+        } else if (err == ESP_OK) {
+            err = ESP_FAIL;
+        }
+        if (restart) {
+            const esp_err_t startErr = pcnt_unit_start(_pcntUnit);
+            if (startErr == ESP_OK) {
+                _pcntUnitStarted = true;
+            } else {
+                if (err == ESP_OK) err = startErr;
+                _pcntInitialized = false;
+                ESP_LOGE(TAG, "GPIO%d PCNT restart after reset failed: %s",
+                         _pin, esp_err_to_name(startErr));
+            }
+        }
         if (err != ESP_OK) {
             _lastCounterError = err;
             return err;
-        }
-        if (UINT64_MAX - _pulseCountOffset < currentCount) {
-            _pulseCountOffset = UINT64_MAX;
-        } else {
-            _pulseCountOffset += currentCount;
         }
 #else
         _lastCounterError = ESP_ERR_NOT_SUPPORTED;
         return ESP_ERR_NOT_SUPPORTED;
 #endif
     }
-    _lastPulseSampleCount = _pulseCountOffset;
-    _lastPulseSampleUs = esp_timer_get_time();
+
+    _lastKnownTotalCount = currentTotal;
+    _hasLastKnownTotalCount = true;
+    const int64_t sampleTimeUs = esp_timer_get_time();
+    updatePulseStatistics(currentTotal, sampleTimeUs);
+    _lastPulseSampleCount = currentTotal;
+    _lastPulseSampleUs = sampleTimeUs;
+    _lastRateSampleCount = currentTotal;
+    _lastRateSampleUs = sampleTimeUs;
     _lastCounterError = ESP_OK;
     return ESP_OK;
 }
@@ -736,26 +818,46 @@ esp_err_t WAZEH_Channel::initPulseCounterChecked(
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Preserve the cumulative total when reconfiguring the counter. If the
+    // current backend cannot be read, retain the last known good total; the
+    // resulting transition may lose pulses since that snapshot, which is logged.
+    uint64_t preservedTotal = _lastKnownTotalCount;
+    bool hadKnownTotal = _hasLastKnownTotalCount;
+    if (isCounterAvailable()) {
+        uint64_t liveTotal = 0;
+        if (getPulseCount(&liveTotal) == ESP_OK) {
+            preservedTotal = liveTotal;
+            hadKnownTotal = true;
+        } else {
+            ESP_LOGW(TAG, "GPIO%d reconfiguring counter after read failure; preserving last known total only",
+                     _pin);
+        }
+    }
+
     const esp_err_t cleanupErr = releasePulseCounter();
     if (cleanupErr != ESP_OK) {
         _lastCounterError = cleanupErr;
         return cleanupErr;
     }
 
-    _edge = edge;
     portENTER_CRITICAL(&_inputMux);
+    _edge = edge;
     _usingSoftwareCounter = false;
     _softwarePulseCount = 0;
     portEXIT_CRITICAL(&_inputMux);
-    _pulseCountOffset = 0;
-    _lastPulseSampleCount = 0;
-    _lastPulseSampleUs = 0;
+    _pulseCountOffset = hadKnownTotal ? preservedTotal : 0;
+    _lastKnownTotalCount = _pulseCountOffset;
+    _hasLastKnownTotalCount = hadKnownTotal;
+    _lastPulseSampleCount = _pulseCountOffset;
+    _lastPulseSampleUs = hadKnownTotal ? esp_timer_get_time() : 0;
     _pulseRateHz = 0.0f;
-    _lastRateSampleCount = 0;
+    _lastRateSampleCount = _pulseCountOffset;
     _lastRateSampleUs = 0;
-    for (size_t i = 0; i < 60; ++i) {
-        _pulseBucketSecond[i] = -1;
-        _pulseBuckets[i] = 0;
+    if (!hadKnownTotal) {
+        for (size_t i = 0; i < 60; ++i) {
+            _pulseBucketSecond[i] = -1;
+            _pulseBuckets[i] = 0;
+        }
     }
 
     esp_err_t err = ESP_ERR_NOT_SUPPORTED;
@@ -787,8 +889,8 @@ esp_err_t WAZEH_Channel::initPulseCounterChecked(
     if (err == ESP_OK) {
         err = pcnt_channel_set_level_action(
             _pcntChannel,
-            PCNT_CHANNEL_LEVEL_ACTION_HOLD,
-            PCNT_CHANNEL_LEVEL_ACTION_HOLD);
+            PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+            PCNT_CHANNEL_LEVEL_ACTION_KEEP);
     }
     if (err == ESP_OK && filterNs > 0) {
         pcnt_glitch_filter_config_t filterConfig{};
@@ -882,8 +984,8 @@ void WAZEH_Channel::beginPulseCounter(pcnt_unit_handle_t unit, bool countBothEdg
         if (err == ESP_OK) {
             err = pcnt_channel_set_level_action(
                 _pcntChannel,
-                PCNT_CHANNEL_LEVEL_ACTION_HOLD,
-                PCNT_CHANNEL_LEVEL_ACTION_HOLD);
+                PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                PCNT_CHANNEL_LEVEL_ACTION_KEEP);
         }
         if (err == ESP_OK && filterUs > 0) {
             pcnt_glitch_filter_config_t filterConfig{};
@@ -923,23 +1025,48 @@ void WAZEH_Channel::beginPulseCounter(pcnt_unit_handle_t unit, bool countBothEdg
 
 esp_err_t WAZEH_Channel::useSoftwareCounterChecked()
 {
-    uint64_t previousTotal = _pulseCountOffset;
+    if (!_configured) {
+        _lastCounterError = ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint64_t previousTotal = _hasLastKnownTotalCount ? _lastKnownTotalCount : _pulseCountOffset;
     if (isCounterAvailable()) {
-        const esp_err_t readErr = getPulseCount(&previousTotal);
-        if (readErr != ESP_OK) {
+        uint64_t liveTotal = 0;
+        const esp_err_t readErr = getPulseCount(&liveTotal);
+        if (readErr == ESP_OK) {
+            previousTotal = liveTotal;
+        } else if (_pcntInitialized) {
+            // Recovery must not depend on the failing PCNT read path. Preserve the
+            // last valid snapshot, switch backends, and report that the count may
+            // have a discontinuity for pulses since the snapshot.
+            ESP_LOGW(TAG,
+                     "GPIO%d PCNT read failed (%s); switching with last known total=%" PRIu64
+                     ". Counts since that snapshot may be lost.",
+                     _pin, esp_err_to_name(readErr), previousTotal);
+        } else {
+            _lastCounterError = readErr;
             return readErr;
         }
     }
+
     const esp_err_t err = releasePulseCounter();
     if (err != ESP_OK) {
         _lastCounterError = err;
         return err;
     }
+
     _pulseCountOffset = previousTotal;
+    _lastKnownTotalCount = previousTotal;
+    _hasLastKnownTotalCount = true;
     portENTER_CRITICAL(&_inputMux);
     _softwarePulseCount = 0;
     _usingSoftwareCounter = true;
     portEXIT_CRITICAL(&_inputMux);
+    _lastPulseSampleCount = previousTotal;
+    _lastPulseSampleUs = esp_timer_get_time();
+    _lastRateSampleCount = previousTotal;
+    _lastRateSampleUs = _lastPulseSampleUs;
     _lastCounterError = ESP_OK;
     return ESP_OK;
 }
